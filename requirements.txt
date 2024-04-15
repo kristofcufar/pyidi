@@ -11,4 +11,4 @@ numba
 napari[all]
 magicgui
 opencv-python
-imageio[ffmpeg]
+imageio[pyav]
