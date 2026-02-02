@@ -160,8 +160,14 @@ class LucasKanade(IDIMethod):
         if self.processes != 1: # multiprocessing
             if not self.resume_analysis:
                 self.create_temp_files(init_multi=True)
-            
-            self.displacements = multi(self.video, self, self.processes, configuration_keys=self.configuration_keys)
+
+            self.displacements, self.discarded_points, discarded_coords = multi(
+                self.video, self, self.processes, configuration_keys=self.configuration_keys
+            )
+
+            # Save discarded points information
+            if len(self.discarded_points) > 0:
+                self._save_discarded_points_multi(discarded_coords)
 
             # Clear the temporary files (only once per analysis)
             self.clear_temp_files()
@@ -177,6 +183,7 @@ class LucasKanade(IDIMethod):
             self.create_temp_files(init_multi=False)
 
         self.warnings = []
+        self.discarded_points = set()  # Use set for O(1) membership checking
 
         # Precomputables
         start_time = time.time()
@@ -202,25 +209,44 @@ class LucasKanade(IDIMethod):
 
             # Iterate over points.
             for p, point in enumerate(self.points):
-                
-                # start optimization with previous optimal parameter values
-                d_init = np.round(self.displacements[p, ii-1, :]).astype(int)
-                d_res  = self.displacements[p, ii-1, :] - d_init
 
-                yslice, xslice = self._padded_slice(point+d_init, self.roi_size, self.image_size, 1)
-                G = video.get_frame(i)[yslice, xslice]
+                # Skip this point if it has been discarded
+                if p in self.discarded_points:
+                    self.displacements[p, ii, :] = np.nan
+                    continue
 
-                displacements = self.optimize_translations(
-                    G=G,
-                    F_spline=self.interpolation_splines[p],
-                    maxiter=self.max_nfev,
-                    tol=self.tol,
-                    d_subpixel_init=-d_res,
-                    point_index=p,
-                    frame=i
-                )
+                try:
+                    # start optimization with previous optimal parameter values
+                    d_init = np.round(self.displacements[p, ii-1, :]).astype(int)
+                    d_res  = self.displacements[p, ii-1, :] - d_init
 
-                self.displacements[p, ii, :] = displacements + d_init
+                    yslice, xslice = self._padded_slice(point+d_init, self.roi_size, self.image_size, 1)
+                    G = video.get_frame(i)[yslice, xslice]
+
+                    displacements = self.optimize_translations(
+                        G=G,
+                        F_spline=self.interpolation_splines[p],
+                        maxiter=self.max_nfev,
+                        tol=self.tol,
+                        d_subpixel_init=-d_res,
+                        point_index=p,
+                        frame=i
+                    )
+
+                    self.displacements[p, ii, :] = displacements + d_init
+
+                except (ValueError, RuntimeError) as e:
+                    # Point has failed - discard it for the rest of the calculation
+                    self.discarded_points.add(p)
+                    # Set all displacements for this point to NaN
+                    self.displacements[p, :, :] = np.nan
+
+                    # Print warning
+                    point_coords = f"({point[0]}, {point[1]})"
+                    if self.verbose:
+                        print(f"\nWarning: Point {p} at position {point_coords} failed at frame {i}.")
+                        print(f"  Reason: {str(e)}")
+                        print(f"  This point will be discarded from further calculations.\n")
 
             # temp
             self.temp_disp[:, ii, :] = self.displacements[:, ii, :]
@@ -242,6 +268,9 @@ class LucasKanade(IDIMethod):
                 print(f'Time to complete: {full_time_m:.0f} min, {full_time_s:.1f} s')
             else:
                 print(f'Time to complete: {full_time:.1f} s')
+
+        # Save discarded points to file
+        self._save_discarded_points()
 
         # Clear the temporary files (when multiprocessing is not used)
         if self.process_number == 0:
@@ -401,7 +430,81 @@ class LucasKanade(IDIMethod):
             splines.append(spl)
         self.interpolation_splines = splines
 
-    
+
+    def _save_discarded_points(self):
+        """
+        Save the list of discarded points to a JSON file.
+        The file includes point indices and their coordinates.
+        """
+        if len(self.discarded_points) == 0:
+            return  # Nothing to save
+
+        # Convert set to sorted list for consistent output
+        discarded_list = sorted(list(self.discarded_points))
+
+        # Prepare data to save
+        discarded_data = {
+            'discarded_point_indices': discarded_list,
+            'discarded_point_coordinates': [
+                {'index': p, 'y': int(self.points[p, 0]), 'x': int(self.points[p, 1])}
+                for p in discarded_list
+            ],
+            'total_points': len(self.points),
+            'timestamp': datetime.datetime.now().isoformat()
+        }
+
+        self._write_discarded_points_file(discarded_data)
+
+
+    def _save_discarded_points_multi(self, discarded_coords):
+        """
+        Save discarded points from multiprocessing results.
+
+        :param discarded_coords: List of coordinates for discarded points
+        """
+        if len(self.discarded_points) == 0:
+            return  # Nothing to save
+
+        # Prepare data to save
+        discarded_data = {
+            'discarded_point_indices': self.discarded_points,
+            'discarded_point_coordinates': [
+                {'index': self.discarded_points[i], 'y': int(coord[0]), 'x': int(coord[1])}
+                for i, coord in enumerate(discarded_coords)
+            ],
+            'total_points': len(self.points),
+            'timestamp': datetime.datetime.now().isoformat()
+        }
+
+        self._write_discarded_points_file(discarded_data)
+
+
+    def _write_discarded_points_file(self, discarded_data):
+        """
+        Write discarded points data to a JSON file.
+
+        :param discarded_data: Dictionary containing discarded points information
+        """
+        # Determine the filename
+        if hasattr(self.video, 'input_file') and self.video.input_file is not None:
+            # Create filename based on video file
+            video_name = os.path.splitext(os.path.basename(str(self.video.input_file)))[0]
+            filename = f'discarded_points_{video_name}.json'
+        else:
+            # Fallback filename
+            filename = 'discarded_points.json'
+
+        # Save to file
+        try:
+            with open(filename, 'w') as f:
+                json.dump(discarded_data, f, indent=2)
+            if self.verbose:
+                print(f'\nDiscarded points saved to: {filename}')
+                print(f'Total discarded points: {len(discarded_data["discarded_point_indices"])} out of {discarded_data["total_points"]}')
+        except Exception as e:
+            warnings.warn(f'Failed to save discarded points to file: {str(e)}')
+
+
     def show_points(self, figsize=(15, 5), cmap='gray', color='r'):
         """
         Shoe points to be analyzed, together with ROI borders.
@@ -494,8 +597,25 @@ def multi(video: VideoReader, idi_method: LucasKanade, processes, configuration_
                 for future in futures:
                     out.append(future.result())
 
+                # Sort by process index
                 out1 = sorted(out, key=lambda x: x[1])
-                out1 = np.concatenate([d[0] for d in out1])
+
+                # Concatenate displacements
+                displacements = np.concatenate([d[0] for d in out1])
+
+                # Merge discarded points from all workers
+                all_discarded_points = []
+                all_discarded_coords = []
+                point_offset = 0
+                for result in out1:
+                    discarded_info = result[2]
+                    process_idx = result[1]
+                    # Adjust indices to global point indices
+                    for local_idx in discarded_info['indices']:
+                        global_idx = point_offset + local_idx
+                        all_discarded_points.append(global_idx)
+                    all_discarded_coords.extend(discarded_info['coordinates'])
+                    point_offset += len(points_split[process_idx])
 
     t = time.time() - t_start
     minutes = t//60
@@ -503,8 +623,8 @@ def multi(video: VideoReader, idi_method: LucasKanade, processes, configuration_
     hours = minutes//60
     minutes = minutes%60
     print(f'Computation duration: {hours:0>2.0f}:{minutes:0>2.0f}:{seconds:.2f}')
-    
-    return out1
+
+    return displacements, all_discarded_points, all_discarded_coords
 
 
 def worker(points, idi_kwargs, method_kwargs, i, progress, task_id):
@@ -512,13 +632,22 @@ def worker(points, idi_kwargs, method_kwargs, i, progress, task_id):
     A function that is called when for each job in multiprocessing.
     """
     method_kwargs['show_pbar'] = False # use the rich progress bar insted of tqdm
-    
+
     video = VideoReader(**idi_kwargs)
     idi = LucasKanade(video)
     idi.configure(**method_kwargs)
     idi.configure_multiprocessing(i+1, progress, task_id) # configure the multiprocessing settings
     idi.set_points(points)
-    return idi.get_displacements(autosave=False), i
+    displacements = idi.get_displacements(autosave=False)
+
+    # Return displacements, process index, and discarded points info
+    discarded_set = getattr(idi, 'discarded_points', set())
+    discarded_list = list(discarded_set)
+    discarded_info = {
+        'indices': discarded_list,
+        'coordinates': [points[p] for p in discarded_list]
+    }
+    return displacements, i, discarded_info
 
 
 # @nb.njit
