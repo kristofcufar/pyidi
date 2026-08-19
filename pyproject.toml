@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyidi"
-version = "1.3.2"
+version = "1.3.3"
 license = "MIT"
 description = "Python Image Displacement Identification."
 readme = "README.md"
@@ -27,11 +27,11 @@ dependencies = [
     "mantichora==0.9.7",
     "atpbar",
     "numba",
-    "napari[all]",
-    "magicgui",
     "imageio[pyav]",
-    "opencv-python",
-    "ipywidgets",
+    "opencv-contrib-python",
+    "qtpy",
+    "rich",
+    "cine-handler",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -59,10 +59,14 @@ dev = [
     "sphinx-copybutton",
     "nbsphinx",
     "nbsphinx_link",
+    "ipykernel",
+    "ipywidgets",
 ]
 qt = [
     "pyqt6",
     "pyqtgraph",
+    "napari[all]",
+    "magicgui",
 ]
 
 [project.urls]
@@ -73,4 +77,9 @@ source = "https://github.com/ladisk/pyidi"
 [tool.hatch.build.targets.sdist]
 include = [
     "pyidi/*",
+]
+
+[dependency-groups]
+dev = [
+    "pyidi[qt]",
 ]
